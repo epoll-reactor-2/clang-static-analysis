@@ -29,16 +29,15 @@
 #include "llvm/Support/raw_ostream.h"
 
 using namespace clang;
-using namespace clang::dataflow;
-using namespace clang::tooling;
+namespace dataflow = clang::dataflow;
+namespace tooling = clang::tooling;
 using namespace clang::ast_matchers;
-using namespace llvm;
 
 //===----------------------------------------------------------------------===//
 // Lattice definition
 //===----------------------------------------------------------------------===//
 
-enum class DynamicOrigin {
+enum class DynamicSource {
   Unknown,
   // Integer literal, always known.
   Constant,
@@ -56,53 +55,62 @@ enum class DynamicOrigin {
   Conflicting
 };
 
-llvm::StringRef originToString(DynamicOrigin O) {
+llvm::StringRef dynamicSourceToString(DynamicSource O) {
   switch (O) {
-  case DynamicOrigin::Unknown:
-    return "Unknown";
-  case DynamicOrigin::Constant:
-    return "Constant";
-  case DynamicOrigin::Deterministic:
-    return "Deterministic";
-  case DynamicOrigin::NonDeterministic:
-    return "Non‑Deterministic";
-  case DynamicOrigin::Conflicting:
-    return "Conflicting";
+  case DynamicSource::Unknown:
+    return "unknown";
+  case DynamicSource::Constant:
+    return "constant";
+  case DynamicSource::Deterministic:
+    return "deterministic";
+  case DynamicSource::NonDeterministic:
+    return "non‑deterministic";
+  case DynamicSource::Conflicting:
+    return "conflicting";
   }
   llvm_unreachable("Unhandled origin");
 };
 
-DynamicOrigin join(DynamicOrigin A, DynamicOrigin B) {
+DynamicSource joinSources(DynamicSource A, DynamicSource B) {
   if (A == B) return A;
-  if (A == DynamicOrigin::Unknown) return B;
-  if (B == DynamicOrigin::Unknown) return A;
-  if ((A == DynamicOrigin::Constant && B == DynamicOrigin::Deterministic) ||
-      (B == DynamicOrigin::Constant && A == DynamicOrigin::Deterministic))
-    return DynamicOrigin::Deterministic;
-  return DynamicOrigin::Conflicting;
+  if (A == DynamicSource::Unknown) return B;
+  if (B == DynamicSource::Unknown) return A;
+  if ((A == DynamicSource::Constant && B == DynamicSource::Deterministic) ||
+      (B == DynamicSource::Constant && A == DynamicSource::Deterministic))
+    return DynamicSource::Deterministic;
+  return DynamicSource::Conflicting;
 }
 // One element in the whole per-function dataflow lattice.
 struct DynamicBufferLattice {
   // Mapping of variables and their last updated state of the
   // data source. Used to inspect variable status in the expression.
   // Maps are merged once two lattice nodes are joined together.
-  llvm::DenseMap<const VarDecl *, DynamicOrigin> Origins;
-  llvm::DenseMap<const VarDecl *, std::optional<int64_t>> VarSizes;
+  llvm::DenseMap<const VarDecl *, DynamicSource> DeclStates;
 
-  void setSizeForVar(const VarDecl *VD, DynamicOrigin Origin, std::optional<int64_t> Value) {
-    VarSizes[VD] = Value;
-  }
-  
   bool operator==(const DynamicBufferLattice &Other) const {
-    return Origins == Other.Origins;
+    return DeclStates == Other.DeclStates;
   }
 
   void join(const DynamicBufferLattice &Other) {
-    for (auto &[Var, Origin] : Other.Origins) {
-      Origins[Var] = ::join(Origins[Var], Origin);
+    for (auto &[Var, Origin] : Other.DeclStates) {
+      DeclStates[Var] = joinSources(DeclStates[Var], Origin);
     }
   }
 };
+
+//===----------------------------------------------------------------------===//
+// Warn API
+//===----------------------------------------------------------------------===//
+
+template <unsigned N, typename... Args>
+void emitWarning(ASTContext &Ctx, SourceLocation Loc,
+                 const char (&FormatString)[N], Args &&... args) {
+  DiagnosticsEngine &Diag = Ctx.getDiagnostics();
+  unsigned ID = Diag.getCustomDiagID(DiagnosticsEngine::Warning,
+                                     FormatString);
+  DiagnosticBuilder Builder = Diag.Report(Loc, ID);
+  (Builder << ... << std::forward<Args>(args));
+}
 
 //===----------------------------------------------------------------------===//
 // Function constant fold property
@@ -174,7 +182,7 @@ public:
 // Classify expression type
 //===----------------------------------------------------------------------===//
 
-static DynamicOrigin classifyCallExpr(ASTContext &ASTCtx, const CallExpr *CE) {
+static DynamicSource classifyCallExpr(ASTContext &ASTCtx, const CallExpr *CE) {
   if (const FunctionDecl *FD = CE->getDirectCallee()) {
     if (FD->hasBody()) {
       const Stmt *Body = FD->getBody();
@@ -182,20 +190,20 @@ static DynamicOrigin classifyCallExpr(ASTContext &ASTCtx, const CallExpr *CE) {
       RC.TraverseStmt(const_cast<Stmt *>(Body));
 
       if (RC.isConstFoldable())
-        return DynamicOrigin::Constant;
+        return DynamicSource::Constant;
     }
   }
 
-  return DynamicOrigin::NonDeterministic;
+  return DynamicSource::NonDeterministic;
 }
 
 // This function de-facto decides what the kind of expression we have.
-static DynamicOrigin classifyExpr(ASTContext &ASTCtx, const Expr *E, const DynamicBufferLattice &L) {
+static DynamicSource classifyExpr(ASTContext &ASTCtx, const Expr *E, const DynamicBufferLattice &L) {
   E = E->IgnoreParenImpCasts();
 
   // Integer literal. Always constant, no doubts.
   if (auto *I = dyn_cast<IntegerLiteral>(E))
-    return DynamicOrigin::Constant;
+    return DynamicSource::Constant;
 
   // Explicit cast. Just determine type of underlying expression.
   if (auto *CE = dyn_cast<ExplicitCastExpr>(E))
@@ -205,28 +213,37 @@ static DynamicOrigin classifyExpr(ASTContext &ASTCtx, const Expr *E, const Dynam
   if (auto *CE = dyn_cast<CallExpr>(E))
     return classifyCallExpr(ASTCtx, CE);
 
+  // Ternary operator. Join both sides.
+  if (auto *C = dyn_cast<ConditionalOperator>(E)) {
+    return joinSources(
+      classifyExpr(ASTCtx, C->getLHS(), L),
+      classifyExpr(ASTCtx, C->getRHS(), L)
+    );
+  }
+
   // Binary. The result is join of two sides of the expression.
   // If at least one node in binary node has non-deterministic source, the whole
   // expression also will be non-deterministic.
   if (auto *BO = dyn_cast<BinaryOperator>(E))
-    return ::join(
+    return joinSources(
       classifyExpr(ASTCtx, BO->getLHS(), L),
-      classifyExpr(ASTCtx, BO->getRHS(), L));
+      classifyExpr(ASTCtx, BO->getRHS(), L)
+    );
 
   // Variable declaration. Look up the lattice storage.
   if (auto *DRE = dyn_cast<DeclRefExpr>(E)) {
     const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
-    auto It = L.Origins.find(VD);
-    if (It != L.Origins.end())
+    auto It = L.DeclStates.find(VD);
+    if (It != L.DeclStates.end())
       return It->second;
     else
       // If symbol defined somewhere, but we have not this in
       // current function context, it is unknown. To dig deeper
       // we need inter-function analysis.
-      return DynamicOrigin::NonDeterministic;
+      return DynamicSource::NonDeterministic;
   }
 
-  return DynamicOrigin::Unknown;
+  return DynamicSource::Unknown;
 }
 
 //===----------------------------------------------------------------------===//
@@ -237,6 +254,11 @@ static DynamicOrigin classifyExpr(ASTContext &ASTCtx, const Expr *E, const Dynam
 // it is designed like this to keep track origins of each variable, since
 // each one can be theoretically used in the allocation function
 // size calculation.
+//
+// TODO: AST matcher that will check allocated pointer access
+//       and compare access range with allocated size.
+//       If it is not covered with proper condition,
+//       emit warning.
 class ASTMatcher : public MatchFinder::MatchCallback {
   ASTContext &ASTCtx;
   DynamicBufferLattice &L;
@@ -251,12 +273,12 @@ public:
     const Stmt *Upd  = R.Nodes.getNodeAs<Stmt>("update");
     assert(VD && Val && Upd);
 
-    DynamicOrigin NewO = classifyExpr(ASTCtx, Val, L);
+    DynamicSource NewO = classifyExpr(ASTCtx, Val, L);
 
     if (isa<BinaryOperator>(Upd))
-      L.Origins[VD] = ::join(L.Origins[VD], NewO);
+      L.DeclStates[VD] = joinSources(L.DeclStates[VD], NewO);
     else
-      L.Origins[VD] = NewO;
+      L.DeclStates[VD] = NewO;
   }
 };
 
@@ -265,7 +287,7 @@ public:
 //===----------------------------------------------------------------------===//
 
 class DynamicBufferDataflowAnalysis
-  : public DataflowAnalysis<DynamicBufferDataflowAnalysis, DynamicBufferLattice>
+  : public dataflow::DataflowAnalysis<DynamicBufferDataflowAnalysis, DynamicBufferLattice>
 {
   ASTContext &ASTCtx;
 
@@ -293,7 +315,7 @@ public:
   // The state recorded to the lattice element, which stores actual status
   // of each variable (constant/non-deterministic/unknown). The information
   // collected there is used after dataflow analysis is done.
-  void transfer(const CFGElement &Elt, DynamicBufferLattice &L, Environment &Env) {
+  void transfer(const CFGElement &Elt, DynamicBufferLattice &L, dataflow::Environment &Env) {
     if (!Elt.getAs<CFGStmt>())
       return;
 
@@ -311,7 +333,10 @@ public:
 //===----------------------------------------------------------------------===//
 
 class DynamicBufferAnalyzeAction {
-  using AnalysisResult = std::vector<std::optional<DataflowAnalysisState<DynamicBufferLattice>>>;
+  using AnalysisResult =
+    std::vector<
+      std::optional<
+        dataflow::DataflowAnalysisState<DynamicBufferLattice>>>;
   ASTContext &ASTCtx;
 
 public:
@@ -325,16 +350,16 @@ public:
   //    with given data.
   void analyze(const FunctionDecl &Decl) {
     // Step 1. Prepare ACFG.
-    DataflowAnalysisContext DACtx(std::make_unique<WatchedLiteralsSolver>());
-    auto ACFGOrErr = AdornedCFG::build(Decl);
+    dataflow::DataflowAnalysisContext DACtx(std::make_unique<dataflow::WatchedLiteralsSolver>());
+    auto ACFGOrErr = dataflow::AdornedCFG::build(Decl);
     if (!ACFGOrErr) {
       llvm::errs() << "CFG build failed: " << llvm::toString(ACFGOrErr.takeError()) << "\n";
       return;
     }
-    AdornedCFG ACFG = std::move(*ACFGOrErr);
+    dataflow::AdornedCFG ACFG = std::move(*ACFGOrErr);
 
     // Step 2. Run data flow analysis pass.
-    Environment Env(DACtx, Decl);
+    dataflow::Environment Env(DACtx, Decl);
     DynamicBufferDataflowAnalysis Analysis(ASTCtx);
     auto StatesOrErr = runDataflowAnalysis(ACFG, Analysis, Env);
     if (!StatesOrErr) {
@@ -348,7 +373,7 @@ public:
     inspectDataflowStates(Analysis, ACFG, States);
   }
 
-  void inspectDataflowStates(DynamicBufferDataflowAnalysis &Analysis, AdornedCFG &ACFG, const AnalysisResult &States) {
+  void inspectDataflowStates(DynamicBufferDataflowAnalysis &Analysis, dataflow::AdornedCFG &ACFG, const AnalysisResult &States) {
     const CFG &CFG = ACFG.getCFG();
 
     for (const CFGBlock *Block : CFG) {
@@ -379,11 +404,10 @@ public:
       return;
 
     const Expr *SizeArg = Call->getArg(0)->IgnoreParenImpCasts();
-    DynamicOrigin O = classifyExpr(ASTCtx, SizeArg, Lattice);
+    DynamicSource O = classifyExpr(ASTCtx, SizeArg, Lattice);
 
-    llvm::outs() << "  malloc at ";
-    Call->getExprLoc().print(llvm::outs(), ASTCtx.getSourceManager());
-    llvm::outs() << " -> " << originToString(O) << "\n";
+    emitWarning(ASTCtx, Call->getExprLoc(),
+      "malloc size argument is %0", dynamicSourceToString(O));
   }
 };
 
@@ -421,13 +445,13 @@ class DynamicBufferAction : public ASTFrontendAction {
 };
 
 int main(int argc, const char **argv) {
-  cl::OptionCategory Category("dynamic-buffer-check options");
-  auto Exp = CommonOptionsParser::create(argc, argv, Category);
+  llvm::cl::OptionCategory Category("dynamic-buffer-check options");
+  auto Exp = tooling::CommonOptionsParser::create(argc, argv, Category);
   if (!Exp) {
     llvm::errs() << Exp.takeError() << "\n";
     return 1;
   }
 
-  ClangTool Tool(Exp->getCompilations(), Exp->getSourcePathList());
-  return Tool.run(newFrontendActionFactory<DynamicBufferAction>().get());
+  tooling::ClangTool Tool(Exp->getCompilations(), Exp->getSourcePathList());
+  return Tool.run(tooling::newFrontendActionFactory<DynamicBufferAction>().get());
 }
