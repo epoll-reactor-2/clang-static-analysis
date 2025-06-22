@@ -9,24 +9,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "clang/AST/ASTConsumer.h"
-#include "clang/AST/ASTContext.h"
-#include "clang/AST/Decl.h"
-#include "clang/AST/Expr.h"
-#include "clang/AST/Stmt.h"
-#include "clang/AST/RecursiveASTVisitor.h"
-#include "clang/ASTMatchers/ASTMatchers.h"
-#include "clang/Analysis/CFG.h"
-#include "clang/Analysis/FlowSensitive/DataflowAnalysis.h"
-#include "clang/Analysis/FlowSensitive/DataflowEnvironment.h"
-#include "clang/Analysis/FlowSensitive/DataflowAnalysisContext.h"
-#include "clang/Analysis/FlowSensitive/WatchedLiteralsSolver.h"
-#include "clang/Analysis/FlowSensitive/AdornedCFG.h"
-#include "clang/Frontend/CompilerInstance.h"
-#include "clang/Tooling/CommonOptionsParser.h"
-#include "clang/Tooling/Tooling.h"
-#include "llvm/Support/CommandLine.h"
-#include "llvm/Support/raw_ostream.h"
+// Wiping away tears, I am forced to do this urbicide
+#include "PCH.hpp"
 
 using namespace clang;
 namespace dataflow = clang::dataflow;

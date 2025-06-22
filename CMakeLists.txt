@@ -34,6 +34,8 @@ add_definitions(${LLVM_DEFINITIONS})
 add_executable(DataFlowAnalysis src/DataFlowAnalysis.cpp)
 target_compile_options(DataFlowAnalysis PRIVATE -pipe)
 
+target_precompile_headers(DataFlowAnalysis PRIVATE src/PCH.hpp)
+
 if (NOT LLVM_ENABLE_RTTI)
   target_compile_options(DataFlowAnalysis PRIVATE -fno-rtti -fno-exceptions)
 endif()
