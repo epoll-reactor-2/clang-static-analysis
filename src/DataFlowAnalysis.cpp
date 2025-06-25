@@ -231,6 +231,78 @@ static DynamicSource classifyExpr(ASTContext &ASTCtx, const Expr *E, const Dynam
 }
 
 //===----------------------------------------------------------------------===//
+// Update program state
+//===----------------------------------------------------------------------===//
+
+// This updates lattice state between data flow transfers.
+// Matched AST nodes serves as input data.
+// Updated lattice serves as output data.
+class DynamicBufferUpdateStep {
+  ASTContext &ASTCtx;
+DynamicBufferLattice &L;
+
+public:
+  DynamicBufferUpdateStep(ASTContext &Ctx, DynamicBufferLattice &L)
+    : ASTCtx(Ctx), L(L) {}
+
+  void printLoc(const char *Prefix, SourceLocation Loc) {
+    SourceManager &SM = ASTCtx.getSourceManager();
+    FullSourceLoc FullLoc(Loc, SM);
+
+    if (FullLoc.isValid()) {
+      llvm::outs() << "Got " << Prefix << " at "
+                   << SM.getFilename(FullLoc) << ":"
+                   << FullLoc.getSpellingLineNumber() << ":"
+                   << FullLoc.getSpellingColumnNumber() << "\n";
+    }
+  }
+
+  void runOnDecl(const VarDecl *Decl, const Expr *Value) {
+    printLoc("decl", Decl->getLocation());
+    printLoc("value", Value->getExprLoc());
+
+    L.DeclStates[Decl] = classifyExpr(ASTCtx, Value, L);
+  }
+
+  void runOnAssign(const BinaryOperator *S) {
+    printLoc("assign LHS", S->getLHS()->getExprLoc());
+    printLoc("assign RHS", S->getRHS()->getExprLoc());
+
+    const auto *DRE = dyn_cast<DeclRefExpr>(S->getLHS()->IgnoreParenImpCasts());
+    assert(DRE);
+    const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+    assert(VD);
+
+    llvm::outs() << "Assignment to variable `" << VD->getName() << "`\n";
+
+    DynamicSource New = classifyExpr(ASTCtx, S->getRHS(), L);
+    // NOTE: Should we join or do something else?
+    //       Eventually check if this assignment is covered with some
+    //       condition.
+    L.DeclStates[VD] = joinSources(L.DeclStates[VD], New);
+  }
+
+  void runOnArrayAccess(const BinaryOperator *S) {
+    printLoc("array access", S->getLHS()->getExprLoc());
+
+    const Expr *LHS = S->getLHS()->IgnoreParenImpCasts();
+
+    const auto *ASE = dyn_cast<ArraySubscriptExpr>(LHS);
+    assert(ASE);
+
+    const Expr *Base = ASE->getBase()->IgnoreParenImpCasts();
+    const Expr *Index = ASE->getIdx()->IgnoreParenImpCasts();
+
+    const auto *DRE = dyn_cast<DeclRefExpr>(Base);
+    assert(DRE);
+    const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+    assert(VD);
+
+    llvm::outs() << "Array access to variable `" << VD->getName() << "`\n";
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // AST matcher
 //===----------------------------------------------------------------------===//
 
@@ -238,11 +310,6 @@ static DynamicSource classifyExpr(ASTContext &ASTCtx, const Expr *E, const Dynam
 // it is designed like this to keep track origins of each variable, since
 // each one can be theoretically used in the allocation function
 // size calculation.
-//
-// TODO: AST matcher that will check allocated pointer access
-//       and compare access range with allocated size.
-//       If it is not covered with proper condition,
-//       emit warning.
 class ASTMatcher : public MatchFinder::MatchCallback {
   ASTContext &ASTCtx;
   DynamicBufferLattice &L;
@@ -252,17 +319,16 @@ public:
     : ASTCtx(Ctx), L(L) {}
 
   void run(const MatchFinder::MatchResult &R) override {
-    const auto *VD   = R.Nodes.getNodeAs<VarDecl>("var");
-    const Expr *Val  = R.Nodes.getNodeAs<Expr>("value");
-    const Stmt *Upd  = R.Nodes.getNodeAs<Stmt>("update");
-    assert(VD && Val && Upd);
+    DynamicBufferUpdateStep Step(ASTCtx, L);
 
-    DynamicSource NewO = classifyExpr(ASTCtx, Val, L);
+    if (const auto *VD = R.Nodes.getNodeAs<VarDecl>("analysis_decl"))
+      Step.runOnDecl(VD, R.Nodes.getNodeAs<Expr>("value"));
 
-    if (isa<BinaryOperator>(Upd))
-      L.DeclStates[VD] = joinSources(L.DeclStates[VD], NewO);
-    else
-      L.DeclStates[VD] = NewO;
+    else if (const auto *A = R.Nodes.getNodeAs<BinaryOperator>("analysis_assign"))
+      Step.runOnAssign(A);
+
+    else if (const auto *A = R.Nodes.getNodeAs<BinaryOperator>("analysis_array_access"))
+      Step.runOnArrayAccess(A);
   }
 };
 
@@ -275,17 +341,44 @@ class DynamicBufferDataflowAnalysis
 {
   ASTContext &ASTCtx;
 
-  // Match statements that affects variable.
-  const StatementMatcher UpdateMatcher =
-    stmt(
-      anyOf(
-        // Declaration
-        declStmt(has(varDecl(hasInitializer(expr().bind("value"))).bind("var"))),
-        // Assignment
-        binaryOperator(isAssignmentOperator(),
-          hasLHS(ignoringParenImpCasts(declRefExpr(to(varDecl().bind("var"))))),
-          hasRHS(expr().bind("value"))
-        ))).bind("update");
+  StatementMatcher makeDeclMatcher() {
+    return declStmt(
+      has(varDecl(
+        hasInitializer(expr().bind("value"))
+      ).bind("analysis_decl"))
+    );
+  }
+
+  StatementMatcher makeAssignMatcher() {
+    return binaryOperator(
+      hasOperatorName("="),
+      hasLHS(ignoringParenImpCasts(
+        declRefExpr(to(varDecl().bind("var")))
+      )),
+      hasRHS(expr().bind("value"))
+    ).bind("analysis_assign");
+  }
+
+  StatementMatcher makeArrayAccessMatcher() {
+    return binaryOperator(
+      hasOperatorName("="),
+      hasLHS(ignoringParenImpCasts(
+        arraySubscriptExpr(
+          hasBase(ignoringParenImpCasts(
+            declRefExpr(to(varDecl().bind("var")))
+          )),
+          hasIndex(expr().bind("index"))
+        )
+      )),
+      hasRHS(expr().bind("value"))
+    ).bind("analysis_array_access");
+  }
+
+  const StatementMatcher UpdateMatcher = stmt(anyOf(
+    makeDeclMatcher(),
+    makeAssignMatcher(),
+    makeArrayAccessMatcher()
+  ));
 
 public:
   DynamicBufferDataflowAnalysis(ASTContext &ASTCtx)
@@ -388,6 +481,8 @@ public:
       return;
 
     const Expr *SizeArg = Call->getArg(0)->IgnoreParenImpCasts();
+    // This classification shows us post factum status of the variable.
+    // Initially it also done in AST matcher.
     DynamicSource O = classifyExpr(ASTCtx, SizeArg, Lattice);
 
     emitWarning(ASTCtx, Call->getExprLoc(),

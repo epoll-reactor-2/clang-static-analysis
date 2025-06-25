@@ -163,4 +163,13 @@ void test_malloc_origins(int n) {
     void *p12 = malloc(s12);
     // CHECK: deterministic.cpp:[[#@LINE-1]]:{{[0-9]+}}:  malloc  Conflicting
   }
+  
+  /*────────────────────────────
+    Case 12 – deterministic loop + optional nondet branch.
+    EXPECT: Conflicting
+   *───────────────────────────*/
+
+  char *p12 = (char *) malloc(123);
+  p12[0] = 'a';
+  p12[100] = 'b';
 }
