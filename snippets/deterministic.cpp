@@ -8,9 +8,9 @@ int _is_evaluable() {
 
 int _is_evaluable_branch_same() {
   if (1)
-    return 1;
+    return 10;
   else
-    return 1;
+    return 10;
 }
 
 int _is_evaluable_branch_different() {
@@ -42,10 +42,14 @@ void test_malloc_origins(int n) {
   /*────────────────────────────
     Case 0: Evaluable functions.
    *───────────────────────────*/
-  void *c1 = malloc(_is_evaluable());
-  void *c2 = malloc(_is_not_evaluable());
-  void *c3 = malloc(_is_evaluable_branch_same());
-  void *c4 = malloc(_is_evaluable_branch_different());
+  char *c1 = (char *) malloc(_is_evaluable());
+  char *c2 = (char *) malloc(_is_not_evaluable());
+  char *c3 = (char *) malloc(_is_evaluable_branch_same()); // 10
+  char *c4 = (char *) malloc(_is_evaluable_branch_different());
+  c3[0] = 'a';
+  c3[9] = 'b';
+  c3[10] = 'c';
+  c3[100000] = 'd';
 
   /*────────────────────────────
     Case 1 – compile‑time constant.
@@ -137,7 +141,9 @@ void test_malloc_origins(int n) {
     EXPECT: NonDeterministic
    *───────────────────────────*/
   {
-    void *p10 = malloc(get_size_external());
+    char *p10 = (char *) malloc(get_size_external());
+    p10[0] = 'a';
+    p10[1000] = 'b';
     // CHECK: deterministic.cpp:[[#@LINE-1]]:{{[0-9]+}}:  malloc  NonDeterministic
   }
 
@@ -169,7 +175,9 @@ void test_malloc_origins(int n) {
     EXPECT: Conflicting
    *───────────────────────────*/
 
-  char *p12 = (char *) malloc(123);
+  char *p12 = (char *) malloc(10);
   p12[0] = 'a';
+  p12[1 + 2] = 'a';
+  p12[10 + 20] = 'a';
   p12[100] = 'b';
 }

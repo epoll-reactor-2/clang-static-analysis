@@ -1,4 +1,4 @@
-//===- DataFlowAnalysis.cpp -------------------------------- ----*- C++ -*-===//
+//===- DataFlowAnalysis.cpp -------------------------------------*- C++ -*-===//
 //
 // Example static analysis pass that tracks unknown sources for allocation
 // functions.
@@ -11,11 +11,12 @@
 
 // Wiping away tears, I am forced to do this urbicide
 #include "PCH.hpp"
+#include "clang/AST/Decl.h"
 
 using namespace clang;
+using namespace clang::ast_matchers;
 namespace dataflow = clang::dataflow;
 namespace tooling = clang::tooling;
-using namespace clang::ast_matchers;
 
 //===----------------------------------------------------------------------===//
 // Lattice definition
@@ -70,6 +71,7 @@ struct DynamicBufferLattice {
   // data source. Used to inspect variable status in the expression.
   // Maps are merged once two lattice nodes are joined together.
   llvm::DenseMap<const VarDecl *, DynamicSource> DeclStates;
+  llvm::DenseMap<const VarDecl *, llvm::APSInt> DeclAllocSizes;
 
   bool operator==(const DynamicBufferLattice &Other) const {
     return DeclStates == Other.DeclStates;
@@ -166,6 +168,11 @@ public:
 // Classify expression type
 //===----------------------------------------------------------------------===//
 
+static bool isAllocationFunction(const CallExpr *E) {
+  const FunctionDecl *Callee = E->getDirectCallee();
+  return Callee && Callee->getName() == "malloc";
+}
+
 static DynamicSource classifyCallExpr(ASTContext &ASTCtx, const CallExpr *CE) {
   if (const FunctionDecl *FD = CE->getDirectCallee()) {
     if (FD->hasBody()) {
@@ -257,17 +264,33 @@ public:
     }
   }
 
-  void runOnDecl(const VarDecl *Decl, const Expr *Value) {
-    printLoc("decl", Decl->getLocation());
-    printLoc("value", Value->getExprLoc());
+  std::optional<llvm::APSInt> tryEvalAllocationFunction(const Expr *Value) {
+    const auto *Call = dyn_cast<CallExpr>(Value->IgnoreCasts());
+    if (!Call) {
+      return std::nullopt;
+    }
 
+    if (!isAllocationFunction(Call))
+      return std::nullopt;
+
+    const Expr *SizeArg = Call->getArg(0)->IgnoreParenImpCasts();
+    Expr::EvalResult ER;
+    if (SizeArg->EvaluateAsRValue(ER, ASTCtx) && ER.Val.isInt())
+      return ER.Val.getInt();
+
+    return std::nullopt;
+  }
+
+  void runOnDecl(const VarDecl *Decl, const Expr *Value) {
     L.DeclStates[Decl] = classifyExpr(ASTCtx, Value, L);
+
+    if (auto Result = tryEvalAllocationFunction(Value)) {
+      llvm::outs() << "Variable " << Decl->getName() << " has const malloc(" << *Result << ")\n";
+      L.DeclAllocSizes[Decl] = *Result;
+    }
   }
 
   void runOnAssign(const BinaryOperator *S) {
-    printLoc("assign LHS", S->getLHS()->getExprLoc());
-    printLoc("assign RHS", S->getRHS()->getExprLoc());
-
     const auto *DRE = dyn_cast<DeclRefExpr>(S->getLHS()->IgnoreParenImpCasts());
     assert(DRE);
     const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
@@ -282,9 +305,26 @@ public:
     L.DeclStates[VD] = joinSources(L.DeclStates[VD], New);
   }
 
-  void runOnArrayAccess(const BinaryOperator *S) {
-    printLoc("array access", S->getLHS()->getExprLoc());
+  void verifyIndex(const Expr *Index, const VarDecl *VD) {
+    Expr::EvalResult ER;
+    if (!Index->EvaluateAsRValue(ER, ASTCtx) && ER.Val.isInt())
+      return;
 
+    llvm::outs() << "Array access[" << ER.Val.getInt() << "] to variable `"
+                 << VD->getName() << "`\n";
+    if (!L.DeclAllocSizes.contains(VD))
+      return;
+
+    llvm::APSInt ExprL = ER.Val.getInt();
+    llvm::APSInt ExprR = L.DeclAllocSizes[VD];
+    if (ExprL >= ExprR) {
+      emitWarning(ASTCtx, Index->getExprLoc(),
+                  "Out of range! %0 vs %1",
+                  ExprL.getExtValue(), ExprR.getExtValue());
+    }
+  }
+
+  void runOnArrayAccess(const BinaryOperator *S) {
     const Expr *LHS = S->getLHS()->IgnoreParenImpCasts();
 
     const auto *ASE = dyn_cast<ArraySubscriptExpr>(LHS);
@@ -298,7 +338,7 @@ public:
     const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
     assert(VD);
 
-    llvm::outs() << "Array access to variable `" << VD->getName() << "`\n";
+    verifyIndex(Index, VD);
   }
 };
 
@@ -444,10 +484,13 @@ public:
       return;
     }
 
-    const AnalysisResult &States = *StatesOrErr;
-
     // Step 3. Inspect analysis results.
-    inspectDataflowStates(Analysis, ACFG, States);
+    //
+    // This step is useful if we have to make post-analysis
+    // judgements. In this example it is not needed.
+    //
+    // const AnalysisResult &States = *StatesOrErr;
+    // inspectDataflowStates(Analysis, ACFG, States);
   }
 
   void inspectDataflowStates(DynamicBufferDataflowAnalysis &Analysis, dataflow::AdornedCFG &ACFG, const AnalysisResult &States) {
@@ -469,15 +512,13 @@ public:
       }
     }
   }
-  
+
   void tryAnalyzeCall(const Stmt *S, DynamicBufferDataflowAnalysis &Analysis, const DynamicBufferLattice &Lattice) {
     const auto *Call = dyn_cast<CallExpr>(S);
     if (!Call)
       return;
 
-    const FunctionDecl *Callee = Call->getDirectCallee();
-    if (!Callee || !Callee->getIdentifier() ||
-        Callee->getName() != "malloc")
+    if (!isAllocationFunction(Call))
       return;
 
     const Expr *SizeArg = Call->getArg(0)->IgnoreParenImpCasts();
