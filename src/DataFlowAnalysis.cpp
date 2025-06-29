@@ -11,7 +11,6 @@
 
 // Wiping away tears, I am forced to do this urbicide
 #include "PCH.hpp"
-#include "clang/AST/Decl.h"
 
 using namespace clang;
 using namespace clang::ast_matchers;
@@ -74,7 +73,8 @@ struct DynamicBufferLattice {
   llvm::DenseMap<const VarDecl *, llvm::APSInt> DeclAllocSizes;
 
   bool operator==(const DynamicBufferLattice &Other) const {
-    return DeclStates == Other.DeclStates;
+    return DeclStates == Other.DeclStates
+        && DeclAllocSizes == Other.DeclAllocSizes;
   }
 
   void join(const DynamicBufferLattice &Other) {
@@ -103,7 +103,7 @@ void emitWarning(ASTContext &Ctx, SourceLocation Loc,
 //===----------------------------------------------------------------------===//
 
 // Clang does not provide API to determine const-fold
-// property for call expression, so we are forced to walk
+// property for the functions, so we are forced to walk
 // AST manually and check.
 //
 // Examples:
@@ -228,8 +228,8 @@ static DynamicSource classifyExpr(ASTContext &ASTCtx, const Expr *E, const Dynam
     if (It != L.DeclStates.end())
       return It->second;
     else
-      // If symbol defined somewhere, but we have not this in
-      // current function context, it is unknown. To dig deeper
+      // The symbol is defined somewhere, but does not exists in
+      // current function context, hence has unknown nature for us. To dig deeper
       // we need inter-function analysis.
       return DynamicSource::NonDeterministic;
   }
@@ -246,11 +246,11 @@ static DynamicSource classifyExpr(ASTContext &ASTCtx, const Expr *E, const Dynam
 // Updated lattice serves as output data.
 class DynamicBufferUpdateStep {
   ASTContext &ASTCtx;
-DynamicBufferLattice &L;
+DynamicBufferLattice &Lattice;
 
 public:
   DynamicBufferUpdateStep(ASTContext &Ctx, DynamicBufferLattice &L)
-    : ASTCtx(Ctx), L(L) {}
+    : ASTCtx(Ctx), Lattice(L) {}
 
   void printLoc(const char *Prefix, SourceLocation Loc) {
     SourceManager &SM = ASTCtx.getSourceManager();
@@ -282,11 +282,11 @@ public:
   }
 
   void runOnDecl(const VarDecl *Decl, const Expr *Value) {
-    L.DeclStates[Decl] = classifyExpr(ASTCtx, Value, L);
+    Lattice.DeclStates[Decl] = classifyExpr(ASTCtx, Value, Lattice);
 
     if (auto Result = tryEvalAllocationFunction(Value)) {
       llvm::outs() << "Variable " << Decl->getName() << " has const malloc(" << *Result << ")\n";
-      L.DeclAllocSizes[Decl] = *Result;
+      Lattice.DeclAllocSizes[Decl] = *Result;
     }
   }
 
@@ -298,11 +298,11 @@ public:
 
     llvm::outs() << "Assignment to variable `" << VD->getName() << "`\n";
 
-    DynamicSource New = classifyExpr(ASTCtx, S->getRHS(), L);
+    DynamicSource New = classifyExpr(ASTCtx, S->getRHS(), Lattice);
     // NOTE: Should we join or do something else?
     //       Eventually check if this assignment is covered with some
     //       condition.
-    L.DeclStates[VD] = joinSources(L.DeclStates[VD], New);
+    Lattice.DeclStates[VD] = joinSources(Lattice.DeclStates[VD], New);
   }
 
   void verifyIndex(const Expr *Index, const VarDecl *VD) {
@@ -312,15 +312,15 @@ public:
 
     llvm::outs() << "Array access[" << ER.Val.getInt() << "] to variable `"
                  << VD->getName() << "`\n";
-    if (!L.DeclAllocSizes.contains(VD))
+    if (!Lattice.DeclAllocSizes.contains(VD))
       return;
 
-    llvm::APSInt ExprL = ER.Val.getInt();
-    llvm::APSInt ExprR = L.DeclAllocSizes[VD];
-    if (ExprL >= ExprR) {
+    llvm::APSInt L = ER.Val.getInt();
+    llvm::APSInt R = Lattice.DeclAllocSizes[VD];
+    if (L >= R) {
       emitWarning(ASTCtx, Index->getExprLoc(),
-                  "Out of range! %0 vs %1",
-                  ExprL.getExtValue(), ExprR.getExtValue());
+                  "Out of range! `%0` size equals %1 bytes",
+                  VD->getName(), R.getExtValue());
     }
   }
 
