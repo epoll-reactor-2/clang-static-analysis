@@ -246,7 +246,7 @@ static DynamicSource classifyExpr(ASTContext &ASTCtx, const Expr *E, const Dynam
 // Updated lattice serves as output data.
 class DynamicBufferUpdateStep {
   ASTContext &ASTCtx;
-DynamicBufferLattice &Lattice;
+  DynamicBufferLattice &Lattice;
 
 public:
   DynamicBufferUpdateStep(ASTContext &Ctx, DynamicBufferLattice &L)
@@ -307,7 +307,7 @@ public:
 
   void verifyIndex(const Expr *Index, const VarDecl *VD) {
     Expr::EvalResult ER;
-    if (!Index->EvaluateAsRValue(ER, ASTCtx) && ER.Val.isInt())
+    if (!(Index->EvaluateAsRValue(ER, ASTCtx) && ER.Val.isInt()))
       return;
 
     llvm::outs() << "Array access[" << ER.Val.getInt() << "] to variable `"
